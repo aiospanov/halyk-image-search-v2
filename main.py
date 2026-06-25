@@ -74,34 +74,74 @@ async def call_gemini(image_bytes: bytes) -> dict:
             ]
         }],
         "generationConfig": {
-            "temperature": 0.1,       # низкая температура = стабильные ответы
-            "maxOutputTokens": 256,
-            "responseMimeType": "application/json"
+            "temperature": 0.1,
+            "maxOutputTokens": 512,
+            # responseMimeType убран — не все версии модели его поддерживают
         }
     }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             f"{GEMINI_URL}?key={GEMINI_API_KEY}",
             json=payload,
             headers={"Content-Type": "application/json"}
         )
+        logger.info(f"Gemini HTTP status: {resp.status_code}")
         if resp.status_code != 200:
-            logger.error(f"Gemini error {resp.status_code}: {resp.text[:300]}")
-            raise HTTPException(status_code=502, detail=f"Gemini API error: {resp.status_code}")
-        return resp.json()
+            logger.error(f"Gemini error body: {resp.text[:500]}")
+            raise HTTPException(status_code=502, detail=f"Gemini API error {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        logger.info(f"Gemini raw response: {json.dumps(data)[:800]}")
+        return data
 
 
 def parse_gemini_response(raw: dict) -> dict:
     try:
-        text = raw["candidates"][0]["content"]["parts"][0]["text"]
-        # Убираем markdown-блоки если вдруг Gemini добавил
-        text = re.sub(r"```json|```", "", text).strip()
+        # Логируем полную структуру для отладки
+        logger.info(f"Parsing response keys: {list(raw.keys())}")
+
+        candidates = raw.get("candidates", [])
+        if not candidates:
+            logger.error(f"No candidates in response. Full raw: {raw}")
+            return {"brand": None, "model": None, "category": "другое", "keywords": [], "confidence": 0.0}
+
+        candidate = candidates[0]
+        finish_reason = candidate.get("finishReason", "UNKNOWN")
+        logger.info(f"Finish reason: {finish_reason}")
+
+        # Проверяем блокировку по safety
+        if finish_reason == "SAFETY":
+            logger.warning("Gemini blocked response due to safety filters")
+            return {"brand": None, "model": None, "category": "другое", "keywords": [], "confidence": 0.0}
+
+        content = candidate.get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            logger.error(f"No parts in content: {content}")
+            return {"brand": None, "model": None, "category": "другое", "keywords": [], "confidence": 0.0}
+
+        text = parts[0].get("text", "")
+        logger.info(f"Gemini text response: {repr(text[:300])}")
+
+        # Убираем markdown-обёртку которую Gemini иногда добавляет
+        text = re.sub(r"```json\s*", "", text)
+        text = re.sub(r"```\s*", "", text)
+        text = text.strip()
+
+        # Ищем JSON в тексте если Gemini добавил лишний текст вокруг
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
         result = json.loads(text)
-        logger.info(f"Gemini result: {result}")
+        logger.info(f"Parsed result: {result}")
         return result
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e}. Text was: {repr(text[:300]) if 'text' in dir() else 'N/A'}")
+        return {"brand": None, "model": None, "category": "другое", "keywords": [], "confidence": 0.0}
     except Exception as e:
-        logger.error(f"Failed to parse Gemini response: {e}\nRaw: {raw}")
+        logger.error(f"Unexpected error parsing Gemini response: {e}. Raw: {str(raw)[:300]}")
         return {"brand": None, "model": None, "category": "другое", "keywords": [], "confidence": 0.0}
 
 
@@ -116,6 +156,15 @@ def build_search_labels(result: dict) -> list[str]:
         labels.append(result["category"])
     return labels
 
+
+
+@app.post("/api/debug")
+async def debug_gemini(file: UploadFile = File(...)):
+    """Сырой ответ Gemini для отладки — удали в production."""
+    raw_bytes = await file.read()
+    compressed = compress_image(raw_bytes)
+    gemini_raw = await call_gemini(compressed)
+    return JSONResponse(gemini_raw)
 
 @app.get("/")
 async def health():
