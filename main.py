@@ -75,8 +75,8 @@ async def call_gemini(image_bytes: bytes) -> dict:
         }],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 512,
-            # responseMimeType убран — не все версии модели его поддерживают
+            "maxOutputTokens": 1024,
+            "thinkingConfig": {"thinkingBudget": 0}
         }
     }
 
