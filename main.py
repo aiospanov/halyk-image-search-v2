@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import re
+import asyncio
 from io import BytesIO
 
 import httpx
@@ -81,18 +82,30 @@ async def call_gemini(image_bytes: bytes) -> dict:
     }
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        logger.info(f"Gemini HTTP status: {resp.status_code}")
-        if resp.status_code != 200:
-            logger.error(f"Gemini error body: {resp.text[:500]}")
-            raise HTTPException(status_code=502, detail=f"Gemini API error {resp.status_code}: {resp.text[:200]}")
-        data = resp.json()
-        logger.info(f"Gemini raw response: {json.dumps(data)[:800]}")
-        return data
+        # Retry до 3 раз при 503 (временная перегрузка Gemini)
+        for attempt in range(3):
+            resp = await client.post(
+                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            logger.info(f"Gemini HTTP status: {resp.status_code} (attempt {attempt + 1})")
+
+            if resp.status_code == 503:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning(f"Gemini 503, retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+
+            if resp.status_code != 200:
+                logger.error(f"Gemini error body: {resp.text[:500]}")
+                raise HTTPException(status_code=502, detail=f"Gemini API error {resp.status_code}: {resp.text[:200]}")
+
+            data = resp.json()
+            logger.info(f"Gemini raw response: {json.dumps(data)[:800]}")
+            return data
+
+        raise HTTPException(status_code=503, detail="Gemini временно недоступен, попробуй через несколько секунд")
 
 
 def parse_gemini_response(raw: dict) -> dict:
